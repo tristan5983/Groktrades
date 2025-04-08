@@ -1,0 +1,155 @@
+import requests
+import json
+import time
+import base64
+from websocket import create_connection
+import threading
+
+# Configuration
+API_KEY = "-----------------"  # Replace with your API key
+API_SECRET = "--------------------"  # Replace with your API secret
+AUTH_TOKEN = base64.b64encode(f"{API_KEY}:{API_SECRET}".encode()).decode()  # Base64 encode key:secret
+BASE_URL = "https://api.xeggex.com/api/v2"  # REST API base URL
+WS_URL = "wss://api.xeggex.com"  # WebSocket URL
+SYMBOL = "------/USDT"  # Trading pair
+AMOUNT = "0.1"  # Amount to trade (string, e.g., 0.001 BTC)
+BUY_THRESHOLD = 0.005  # 0.5% price decrease to trigger buy
+PROFIT_MARGIN = 0.01  # 1% profit margin target (net after fees)
+TRADING_FEE = 0.002  # 0.2% fee per trade
+TOTAL_FEE_ADJUSTMENT = TRADING_FEE * 2  # 0.4% total fees (buy + sell)
+MAX_POSITION = 0.5  # Max BTC to hold (as float for comparison)
+
+# Global variables
+last_price = None
+price_history = []
+current_position = 0.0  # Amount of asset held (float for comparison)
+buy_price = None  # Price at which we last bought
+
+# Place buy order
+def place_buy_order(price):
+    create_order_url = f"{BASE_URL}/createorder"
+    headers = {
+        'accept': 'application/json',
+        'Authorization': f'Basic {AUTH_TOKEN}',
+        'Content-Type': 'application/json'
+    }
+    buy_price = price  # Use the trade price directly
+    create_order_payload = {
+        "symbol": SYMBOL,
+        "side": "buy",
+        "type": "limit",
+        "quantity": AMOUNT,
+        "price": str(buy_price),
+        "strictValidate": False
+    }
+    try:
+        response = requests.post(create_order_url, headers=headers, json=create_order_payload)
+        response.raise_for_status()
+        response_json = response.json()
+        order_id = response_json.get('id')
+        price = response_json.get('price')
+        executed_price = float(price) if price else buy_price
+        fee = executed_price * TRADING_FEE
+        print(f"Buy order {order_id} placed successfully. Price: {executed_price}, Fee: {fee:.6f}")
+        return order_id, executed_price
+    except Exception as e:
+        print(f"Error placing buy order: {e}")
+        return None, None
+
+# Place sell order
+def place_sell_order(buy_price):
+    create_order_url = f"{BASE_URL}/createorder"
+    headers = {
+        'accept': 'application/json',
+        'Authorization': f'Basic {AUTH_TOKEN}',
+        'Content-Type': 'application/json'
+    }
+    sell_price = buy_price * (1 + PROFIT_MARGIN + TOTAL_FEE_ADJUSTMENT)  # Adjust for fees
+    create_order_payload = {
+        "symbol": SYMBOL,
+        "side": "sell",
+        "type": "limit",
+        "quantity": str(current_position),  # Sell entire position
+        "price": str(sell_price),
+        "strictValidate": False
+    }
+    try:
+        response = requests.post(create_order_url, headers=headers, json=create_order_payload)
+        response.raise_for_status()
+        response_json = response.json()
+        order_id = response_json.get('id')
+        price = response_json.get('price')
+        executed_price = float(price) if price else sell_price
+        fee = executed_price * TRADING_FEE
+        print(f"Sell order {order_id} placed successfully. Price: {executed_price}, Fee: {fee:.6f}")
+        return order_id, executed_price
+    except Exception as e:
+        print(f"Error placing sell order: {e}")
+        return None, None
+
+# WebSocket handler with subscribeTrades
+def websocket_handler():
+    global last_price, price_history, current_position, buy_price
+    ws = create_connection(WS_URL)
+    
+    # Subscribe to trades
+    subscription = {
+        "jsonrpc": "2.0",
+        "method": "subscribeTrades",
+        "params": {"symbol": SYMBOL}
+    }
+    ws.send(json.dumps(subscription))
+    
+    while True:
+        data = json.loads(ws.recv())
+        if "method" in data and "params" in data and "data" in data["params"]:
+            trades = data["params"]["data"]
+            for trade in trades:
+                price = float(trade["price"])
+                if price and price != last_price:
+                    last_price = price
+                    price_history.append(price)
+                    if len(price_history) > 5:  # Keep last 5 prices
+                        price_history.pop(0)
+                    analyze_prices()
+
+def analyze_prices():
+    global current_position, buy_price
+    if len(price_history) < 2:
+        return
+
+    price_change = (price_history[-1] - price_history[0]) / price_history[0]
+    print(f"Price: {last_price:.2f}, Change: {price_change:.4f}, Position: {current_position}")
+
+    # Buy logic: Price decreases by BUY_THRESHOLD and we don't hold max position
+    if (price_change <= -BUY_THRESHOLD and 
+        current_position < MAX_POSITION):
+        order_id, executed_price = place_buy_order(last_price)
+        if order_id:  # Success check
+            current_position += float(AMOUNT)
+            buy_price = executed_price
+            print(f"Position updated: {current_position}, Buy price: {buy_price}")
+
+    # Sell logic: Price increases to achieve PROFIT_MARGIN after fees
+    elif (buy_price and current_position > 0 and 
+          last_price >= buy_price * (1 + PROFIT_MARGIN + TOTAL_FEE_ADJUSTMENT)):
+        order_id, executed_price = place_sell_order(buy_price)
+        if order_id:  # Success check
+            net_profit = (executed_price * (1 - TRADING_FEE)) - (buy_price * (1 + TRADING_FEE))
+            print(f"Net profit after fees: {net_profit:.6f}")
+            current_position = 0
+            buy_price = None
+            print("Position cleared")
+
+# Start WebSocket in a separate thread
+if __name__ == "__main__":
+    ws_thread = threading.Thread(target=websocket_handler)
+    ws_thread.daemon = True
+    ws_thread.start()
+
+    # Keep the main thread alive
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Shutting down...")
